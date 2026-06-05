@@ -101,8 +101,88 @@ public struct Query: Sendable {
 
     // MARK: - Execute
 
-    /// Run the query once.
+    /// Run the query once using the default source (cache-then-server).
     public func getDocuments() async throws -> QuerySnapshot {
+        try await getDocuments(source: .default)
+    }
+
+    /// Run the query with explicit source control. Behavior matches the
+    /// `DocumentReference.getDocument(source:)` contract:
+    /// - `.default`: return cached results immediately (if any); refresh
+    ///   from the server in the background. Falls back to a network call
+    ///   on a cold cache.
+    /// - `.server`: always go to the network. Refreshes the cache.
+    /// - `.cache`: only the cache. Empty result if the query has never
+    ///   been fetched.
+    public func getDocuments(source: Source) async throws -> QuerySnapshot {
+        let qhash = Self.queryHash(
+            collection: collectionPath,
+            filters: filters, orders: orders, limit: limitValue
+        )
+
+        if source == .cache {
+            let cached = sdk.cache?.queryResults(qhash) ?? []
+            return QuerySnapshot(
+                documents: cached.map { (id, data) in
+                    DocumentSnapshot(
+                        ref: DocumentReference(
+                            sdk: sdk,
+                            collectionPath: collectionPath,
+                            documentID: id,
+                            databaseId: databaseId
+                        ),
+                        documentID: id,
+                        data: data,
+                        exists: true,
+                        updateTime: nil
+                    )
+                }
+            )
+        }
+
+        if source == .default,
+           let cache = sdk.cache,
+           case let cachedRows = cache.queryResults(qhash),
+           !cachedRows.isEmpty
+        {
+            // Refresh in the background; return cached docs synchronously.
+            let sdkRef = sdk
+            let col = collectionPath
+            let db = databaseId
+            let f = filters
+            let o = orders
+            let l = limitValue
+            Task {
+                guard let fresh = try? await sdkRef.apiClient.listDocuments(
+                    projectId: sdkRef.config.projectId,
+                    databaseId: db,
+                    collection: col,
+                    filters: f, orders: o, limit: l
+                ) else { return }
+                for raw in fresh {
+                    cache.setDocument(
+                        collection: col, id: raw.id, data: raw.dataDictionary
+                    )
+                }
+                cache.setQueryResults(qhash, docIds: fresh.map { $0.id })
+            }
+            return QuerySnapshot(
+                documents: cachedRows.map { (id, data) in
+                    DocumentSnapshot(
+                        ref: DocumentReference(
+                            sdk: sdk,
+                            collectionPath: collectionPath,
+                            documentID: id,
+                            databaseId: databaseId
+                        ),
+                        documentID: id, data: data,
+                        exists: true, updateTime: nil
+                    )
+                }
+            )
+        }
+
+        // Cold cache (or .server) — network fetch with cache write-through.
         let docs = try await sdk.apiClient.listDocuments(
             projectId: sdk.config.projectId,
             databaseId: databaseId,
@@ -111,6 +191,14 @@ public struct Query: Sendable {
             orders: orders,
             limit: limitValue
         )
+        if let cache = sdk.cache {
+            for raw in docs {
+                cache.setDocument(
+                    collection: collectionPath, id: raw.id, data: raw.dataDictionary
+                )
+            }
+            cache.setQueryResults(qhash, docIds: docs.map { $0.id })
+        }
         return QuerySnapshot(
             documents: docs.map { raw in
                 DocumentSnapshot(
@@ -126,6 +214,22 @@ public struct Query: Sendable {
                     updateTime: raw.updatedAt
                 )
             }
+        )
+    }
+
+    /// Stable string hash of this query, used as the cache key.
+    private static func queryHash(
+        collection: String,
+        filters: [Filter], orders: [Order], limit: Int?
+    ) -> String {
+        let fTuples = filters.map { (
+            field: $0.field, op: $0.op.rawValue,
+            value: String(describing: $0.value)
+        ) }
+        let oTuples = orders.map { (field: $0.field, descending: $0.descending) }
+        return PersistentCache.hashQuery(
+            collection: collection,
+            filters: fTuples, orders: oTuples, limit: limit
         )
     }
 

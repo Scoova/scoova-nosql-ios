@@ -198,16 +198,33 @@ actor ApiClient {
     private func endpoint(
         _ project: String, _ db: String, _ collection: String, _ docId: String? = nil
     ) -> URL {
-        var url = baseURL
-            .appendingPathComponent("v1")
-            .appendingPathComponent("projects")
-            .appendingPathComponent(project)
-            .appendingPathComponent("databases")
-            .appendingPathComponent(db)
-            .appendingPathComponent("documents")
-            .appendingPathComponent(collection)
-        if let id = docId { url.appendPathComponent(id) }
-        return url
+        // Compose by building the encoded path string ourselves rather
+        // than relying on `URL.appendingPathComponent`. Foundation's
+        // version doesn't re-encode characters that LOOK like percent-
+        // escapes (e.g. a literal "%" or a malformed "%xy"), so a user-
+        // typed serial number containing "%" reached Cloudflare as an
+        // invalid URL and got rejected with an HTML 400 at the edge —
+        // never seen by our backend. Hard-encoding here makes the SDK
+        // robust against any document id payload.
+        let parts = [
+            "v1", "projects", project, "databases", db, "documents", collection
+        ] + (docId.map { [$0] } ?? [])
+        let path = parts.map(Self.pathEscape).joined(separator: "/")
+        // baseURL already ends without a trailing slash on construction;
+        // join with an explicit "/" so we don't drop the host.
+        return URL(string: baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                   + "/" + path)!
+    }
+
+    /// Aggressively percent-encode a single path segment. We start from
+    /// `.urlPathAllowed` (which keeps unreserved chars + a handful that
+    /// are usually safe inside a segment) and then subtract characters
+    /// that have *segment-level* meaning — slash, ? and # primarily —
+    /// plus `%` itself so we never re-emit a half-encoded triplet.
+    private static func pathEscape(_ s: String) -> String {
+        var safe = CharacterSet.urlPathAllowed
+        safe.remove(charactersIn: "/?#%")
+        return s.addingPercentEncoding(withAllowedCharacters: safe) ?? s
     }
 
     private func jsonQueryString(_ v: JSONValue) throws -> String {

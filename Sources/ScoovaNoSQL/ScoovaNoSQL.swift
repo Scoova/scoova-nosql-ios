@@ -87,14 +87,112 @@ public final class ScoovaNoSQL: @unchecked Sendable {
 
     let apiClient: ApiClient
     let realtime: RealtimeClient
+    /// Local SQLite-backed cache enabling Firestore-like offline reads,
+    /// write-through, and pending-write replay. `nil` only if the cache
+    /// failed to open (corrupt disk, missing permissions) — the SDK
+    /// silently falls back to network-only mode in that case.
+    let cache: PersistentCache?
+    /// Background task driving pending-write replay. Held strong so the
+    /// task isn't cancelled before the queue drains. Created on demand
+    /// after the first failed network write.
+    var pendingWriteReplayer: Task<Void, Never>?
 
     private init(config: Configuration) {
         self.config = config
         self.apiClient = ApiClient(config: config)
         self.realtime = RealtimeClient(config: config)
+        self.cache = try? PersistentCache(
+            projectId: config.projectId,
+            databaseId: config.databaseId
+        )
+        // If the previous session left unconfirmed writes on disk, kick
+        // the replay loop now so they go out as soon as the network is
+        // reachable — without waiting for the next in-app write to fail.
+        if let cache = cache, !cache.pendingWrites().isEmpty {
+            // Schedule on the next runloop tick so `self` is fully
+            // initialised when the Task captures it.
+            DispatchQueue.main.async { [weak self] in
+                self?.schedulePendingWriteReplay()
+            }
+        }
     }
 
     // MARK: - Database entry points
+
+    /// Kick the background replay loop. Idempotent — if a replay task is
+    /// already running, this is a no-op. Called by DocumentReference whenever
+    /// a write fails the network round-trip and gets parked in the queue.
+    func schedulePendingWriteReplay() {
+        guard let cache = cache else { return }
+        if let existing = pendingWriteReplayer, !existing.isCancelled { return }
+        let apiClient = self.apiClient
+        let cfg = self.config
+        pendingWriteReplayer = Task { [weak self] in
+            // Try to drain the queue with exponential backoff. Each pass:
+            // walk every pending row, attempt its op, and on failure bump
+            // retry_count + last_error then sleep before the next pass.
+            var delaySec: UInt64 = 2
+            while !Task.isCancelled {
+                let pending = cache.pendingWrites()
+                if pending.isEmpty {
+                    self?.pendingWriteReplayer = nil
+                    return
+                }
+                var allOk = true
+                for w in pending {
+                    do {
+                        switch w.op {
+                        case "set":
+                            try await apiClient.upsertDocument(
+                                projectId: cfg.projectId,
+                                databaseId: cfg.databaseId,
+                                collection: w.collection,
+                                documentID: w.docId,
+                                data: w.data ?? [:],
+                                merge: false
+                            )
+                        case "update":
+                            try await apiClient.upsertDocument(
+                                projectId: cfg.projectId,
+                                databaseId: cfg.databaseId,
+                                collection: w.collection,
+                                documentID: w.docId,
+                                data: w.data ?? [:],
+                                merge: true
+                            )
+                        case "delete":
+                            try await apiClient.deleteDocument(
+                                projectId: cfg.projectId,
+                                databaseId: cfg.databaseId,
+                                collection: w.collection,
+                                documentID: w.docId
+                            )
+                        default:
+                            // Unknown op — drop it so we don't loop forever.
+                            break
+                        }
+                        cache.removePendingWrite(id: w.id)
+                    } catch {
+                        allOk = false
+                        cache.recordPendingWriteFailure(
+                            id: w.id,
+                            error: String(describing: error)
+                        )
+                    }
+                    if Task.isCancelled { return }
+                }
+                if allOk {
+                    self?.pendingWriteReplayer = nil
+                    return
+                }
+                // Back off; cap at 60 s. Next loop will re-read fresh
+                // queue contents (caller might have enqueued more).
+                try? await Task.sleep(nanoseconds: delaySec * 1_000_000_000)
+                delaySec = min(delaySec * 2, 60)
+            }
+            self?.pendingWriteReplayer = nil
+        }
+    }
 
     /// Return a reference to a collection at the root of the configured database.
     public func collection(_ path: String) -> CollectionReference {
