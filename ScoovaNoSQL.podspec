@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "ScoovaNoSQL"
-  s.version          = "1.0.0"
+  s.version          = "1.0.1"
   s.summary          = "Scoova NoSQL document database client for iOS and macOS."
   s.description      = <<-DESC
                        Swift client for the Scoova NoSQL document database.
