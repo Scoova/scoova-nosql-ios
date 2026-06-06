@@ -101,11 +101,12 @@ public struct DocumentReference: Sendable {
 
     /// Create or overwrite the document.  Any fields not in `data` are dropped.
     public func setData(_ data: [String: Any]) async throws {
+        let sanitized = Self.sanitizedForJSONBStorage(data)
         // Write-through: cache reflects the intent immediately so listeners
         // and subsequent cache reads see the new value before the network
         // round-trip completes (Firestore's "latency compensation").
         sdk.cache?.setDocument(
-            collection: collectionPath, id: documentID, data: data
+            collection: collectionPath, id: documentID, data: sanitized
         )
         do {
             try await sdk.apiClient.upsertDocument(
@@ -113,7 +114,7 @@ public struct DocumentReference: Sendable {
                 databaseId: databaseId,
                 collection: collectionPath,
                 documentID: documentID,
-                data: data,
+                data: sanitized,
                 merge: false
             )
         } catch {
@@ -122,7 +123,7 @@ public struct DocumentReference: Sendable {
             // to work offline.
             sdk.cache?.enqueueWrite(
                 op: "set", collection: collectionPath,
-                docId: documentID, merge: false, data: data
+                docId: documentID, merge: false, data: sanitized
             )
             sdk.schedulePendingWriteReplay()
             throw error
@@ -132,8 +133,9 @@ public struct DocumentReference: Sendable {
     /// Merge `data` into the existing document — fields not present in
     /// `data` are preserved. Fails if the document doesn't exist.
     public func updateData(_ data: [String: Any]) async throws {
+        let sanitized = Self.sanitizedForJSONBStorage(data)
         sdk.cache?.mergeDocument(
-            collection: collectionPath, id: documentID, data: data
+            collection: collectionPath, id: documentID, data: sanitized
         )
         do {
             try await sdk.apiClient.upsertDocument(
@@ -141,17 +143,73 @@ public struct DocumentReference: Sendable {
                 databaseId: databaseId,
                 collection: collectionPath,
                 documentID: documentID,
-                data: data,
+                data: sanitized,
                 merge: true
             )
         } catch {
             sdk.cache?.enqueueWrite(
                 op: "update", collection: collectionPath,
-                docId: documentID, merge: true, data: data
+                docId: documentID, merge: true, data: sanitized
             )
             sdk.schedulePendingWriteReplay()
             throw error
         }
+    }
+
+    /// Walk a document payload and strip characters that PostgreSQL's
+    /// `jsonb` column type refuses — specifically the NUL byte (U+0000)
+    /// and its 6-character JSON escape ``. The JSON spec allows
+    /// them; Postgres explicitly doesn't (TEXT is internally
+    /// NUL-terminated) so any write carrying one comes back as a 500.
+    ///
+    /// We surfaced this through riders re-adding BLE-paired scooters:
+    /// the GATT characteristic carried a C-string-style NUL terminator,
+    /// iOS's `.trimmingCharacters(in: .whitespacesAndNewlines)` doesn't
+    /// touch NUL (NUL isn't whitespace), so the dirty serial flowed all
+    /// the way to the document store. Doing the strip here means every
+    /// `setData`/`updateData` call across the whole app is protected,
+    /// not just the device-add path.
+    ///
+    /// Recurses into nested dictionaries and arrays; primitives that
+    /// aren't strings pass through untouched. Sanitization is idempotent
+    /// and safe to apply twice.
+    static func sanitizedForJSONBStorage(_ data: [String: Any]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        out.reserveCapacity(data.count)
+        for (k, v) in data {
+            out[k] = sanitizeValue(v)
+        }
+        return out
+    }
+
+    private static func sanitizeValue(_ value: Any) -> Any {
+        switch value {
+        case let s as String:
+            return sanitizeString(s)
+        case let dict as [String: Any]:
+            return sanitizedForJSONBStorage(dict)
+        case let arr as [Any]:
+            return arr.map { sanitizeValue($0) }
+        default:
+            return value
+        }
+    }
+
+    private static func sanitizeString(_ s: String) -> String {
+        // `nulChar` is U+0000 written via the Unicode-escape form so the
+        // source file itself never contains a literal NUL byte (Swift
+        // warns about NULs in source).
+        let nulChar = "\u{0000}"
+        // Fast path: no NUL anywhere → return the original instance so
+        // we don't pay an allocation on every clean write (which is the
+        // vast majority).
+        if !s.contains(nulChar) && !s.contains("\\u0000") && !s.contains("\\U0000") {
+            return s
+        }
+        return s
+            .replacingOccurrences(of: nulChar, with: "")
+            .replacingOccurrences(of: "\\u0000", with: "")
+            .replacingOccurrences(of: "\\U0000", with: "")
     }
 
     /// Delete the document. Idempotent — succeeds even if already gone.
